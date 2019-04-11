@@ -1,3 +1,5 @@
+mod bytes;
+
 #[cfg(windows)]
 pub mod colorable_windows;
 #[cfg(windows)]
