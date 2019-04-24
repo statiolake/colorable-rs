@@ -56,14 +56,6 @@ fn colorable<W: Write>(out: W, handle: HANDLE) -> Colorable<W> {
     }
 }
 
-fn get_console_screen_buffer_info(handle: HANDLE) -> CONSOLE_SCREEN_BUFFER_INFO {
-    unsafe {
-        let mut csbi = zeroed();
-        wincon::GetConsoleScreenBufferInfo(handle, &mut csbi);
-        csbi
-    }
-}
-
 const COLOR256: [u32; 256] = [
     0x00_00_00, 0x80_00_00, 0x00_80_00, 0x80_80_00, 0x00_00_80, 0x80_00_80, 0x00_80_80, 0xc0_c0_c0,
     0x80_80_80, 0xff_00_00, 0x00_ff_00, 0xff_ff_00, 0x00_00_ff, 0xff_00_ff, 0x00_ff_ff, 0xff_ff_ff,
@@ -173,6 +165,9 @@ const COLOR16: [ConsoleColor; 16] = [
     ConsoleColor::new(0xff_ff_ff, true, true, true, true),
 ];
 
+const ESC: u8 = 0x1b;
+const BEL: u8 = 0x07;
+
 impl<W: Write> io::Write for Colorable<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let csbi = get_console_screen_buffer_info(self.handle);
@@ -180,17 +175,33 @@ impl<W: Write> io::Write for Colorable<W> {
 
         self.rest.reset_counter();
 
-        while let Some(c1) = self.rest.next() {
-            if c1 != 0x1b {
+        'mainloop: while let Some(c1) = self.rest.next() {
+            if c1 != ESC {
                 self.out.write_all(&[c1])?;
                 continue;
             }
 
-            match self.rest.next() {
+            let c2 = match self.rest.next() {
                 None => break,
-                Some(b'>') => continue,
-                Some(c2 @ b']') => 
+                Some(c) => c,
             };
+
+            let handled = match c2 {
+                b'7' => self.handle_save_cursor_pos(),
+                b'8' => self.handle_restore_cursor_pos(),
+                b'[' => self.handle_csi(),
+                b']' => self.handle_osc(),
+                _ => false,
+            };
+
+            if !handled {
+                // if the function didn't handle them, it means it lacks some
+                // parts of bytes.  unget for now and wait for things to be
+                // prepared.
+                self.rest.unget(c2);
+                self.rest.unget(c1);
+                break 'mainloop;
+            }
         }
 
         Ok(self.rest.read_count())
@@ -198,5 +209,82 @@ impl<W: Write> io::Write for Colorable<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+impl<W: Write> Colorable<W> {
+    fn handle_save_cursor_pos(&mut self) -> bool {
+        self.oldpos = get_console_screen_buffer_info(self.handle).dwCursorPosition;
+        true
+    }
+
+    fn handle_restore_cursor_pos(&mut self) -> bool {
+        set_console_cursor_position(self.handle, self.oldpos);
+        true
+    }
+
+    fn handle_csi(&mut self) -> bool {
+        unimplemented!()
+    }
+
+    fn handle_osc(&mut self) -> bool {
+        if !self.rest.exists(BEL) {
+            // BEL is the end of the OSC commadns, so no BEL means entire sequence has not been
+            // written yet.  waiting for next call of Write::write(), hoping the next time things
+            // are got ready.
+            return false;
+        }
+
+        let id = self.rest.by_ref().take_while(|&x| x != b';');
+        let id = id.fold(0u32, |sum, x| sum + (x - b'0') as u32);
+
+        let arg = self.rest.by_ref().take_while(|&x| x != BEL);
+        let arg: Vec<_> = arg.collect();
+
+        match id {
+            1 | 2 | 3 => set_console_title(String::from_utf8_lossy(&arg).into()),
+            4 => unimplemented!("OSC: changing color palette"),
+            5 => unimplemented!("OSC: getting char color"),
+            10 | 12 | 13 | 15 | 18 | 19 => unimplemented!("OSC: getting char color"),
+            11 | 14 | 16 | 17 => unimplemented!("OSC: getting foreground color"),
+            52 => unimplemented!("OSC: manipulating clipboard contents"),
+            104 => unimplemented!("OSC: resetting color palette"),
+            105 => {}
+            110 | 112 | 113 | 115 | 118 | 119 => unimplemented!("OSC: resetting char color"),
+            111 | 114 | 116 | 117 => unimplemented!("OSC: resetting background color"),
+
+            1337 => unimplemented!("OSC: 1337"),
+
+            800 => unimplemented!("OSC: changing kanji code"),
+
+            801 => unimplemented!("OSC: pronounce by synthesized voice"), // !?
+
+            id => panic!("OSC: unknown command id: {}", id),
+        }
+
+        true
+    }
+}
+
+fn set_console_cursor_position(handle: HANDLE, pos: COORD) {
+    unsafe {
+        wincon::SetConsoleCursorPosition(handle, pos);
+    }
+}
+
+fn get_console_screen_buffer_info(handle: HANDLE) -> CONSOLE_SCREEN_BUFFER_INFO {
+    unsafe {
+        let mut csbi = zeroed();
+        wincon::GetConsoleScreenBufferInfo(handle, &mut csbi);
+        csbi
+    }
+}
+
+fn set_console_title(title: String) {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStrExt;
+    unsafe {
+        let title: Vec<_> = OsString::from(title).encode_wide().collect();
+        wincon::SetConsoleTitleW(title.as_ptr());
     }
 }
